@@ -1,0 +1,9 @@
+services:
+  assistant:
+    build: .
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      - ./app:/app/app
+      - ./data:/data

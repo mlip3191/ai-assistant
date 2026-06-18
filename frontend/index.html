@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>AI Assistant</title>
+  <style>
+    body { font-family: sans-serif; max-width: 700px; margin: 40px auto; padding: 0 20px; }
+    #chat { height: 500px; overflow-y: auto; border: 1px solid #ddd; 
+            border-radius: 8px; padding: 16px; margin-bottom: 12px; }
+    .user { text-align: right; color: #0066cc; margin: 8px 0; }
+    .assistant { text-align: left; color: #333; margin: 8px 0; }
+    #input { width: calc(100% - 90px); padding: 10px; border: 1px solid #ddd; border-radius: 6px; }
+    button { padding: 10px 16px; background: #0066cc; color: white; 
+             border: none; border-radius: 6px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h2>🤖 AI Personal Assistant</h2>
+  <div id="chat"></div>
+  <input id="input" placeholder="Ask me anything..." onkeydown="if(event.key==='Enter') send()" />
+  <button onclick="send()">Send</button>
+  <button onclick="clearMemory()" style="background:#888; margin-left:6px">Clear</button>
+
+  <script>
+    async function send() {
+      const input = document.getElementById('input');
+      const text = input.value.trim();
+      if (!text) return;
+      addMessage(text, 'user');
+      input.value = '';
+      const res = await fetch('/chat', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({text})
+      });
+      const data = await res.json();
+      addMessage(data.response, 'assistant');
+    }
+
+    function addMessage(text, role) {
+      const chat = document.getElementById('chat');
+      chat.innerHTML += `<div class="${role}"><b>${role === 'user' ? 'You' : 'Assistant'}:</b> ${text}</div>`;
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    async function clearMemory() {
+      await fetch('/clear', {method: 'POST'});
+      document.getElementById('chat').innerHTML = '<i>Memory cleared.</i>';
+    }
+  </script>
+</body>
+</html>
