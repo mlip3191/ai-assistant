@@ -2,7 +2,7 @@ import discord
 import os
 import json
 import re
-import httpx  # ← make sure it's up here, not inside the function
+import httpx
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -55,12 +55,15 @@ def parse_reminder_time(time_str: str) -> datetime | None:
         delta = {'second': timedelta(seconds=amount), 'minute': timedelta(minutes=amount), 'hour': timedelta(hours=amount)}[unit]
         return now + delta
 
-    # Full datetime: "2024-12-25 09:00"
-    try:
-        dt = datetime.strptime(normalized, "%Y-%m-%d %H:%M")
-        return dt.replace(tzinfo=timezone.utc)
-    except ValueError:
-        pass
+    # Full datetime with optional seconds: "2024-12-25T09:00:00+00:00" or "2024-12-25 09:00"
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            dt = datetime.strptime(normalized, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except ValueError:
+            pass
 
     # "3pm", "3:30pm", "15:00", "15:30"
     match = re.match(r'^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$', normalized)
@@ -88,20 +91,80 @@ def schedule_reminder(user_id: int, message: str, time_str: str) -> str:
     if not run_time:
         return f"Couldn't parse time '{time_str}'. Try formats like '3pm', '15:30', 'in 10 minutes', or '2024-12-25 09:00'."
 
+    job_id = f"reminder_{user_id}_{run_time.timestamp()}"
     scheduler.add_job(
         fire_reminder,
         trigger=DateTrigger(run_date=run_time),
         args=[user_id, message],
-        id=f"reminder_{user_id}_{run_time.timestamp()}"
+        id=job_id
     )
 
+    # Overwrite the last entry's time with the resolved ISO timestamp so
+    # reload_reminders_from_file can reschedule correctly after a restart.
+    _patch_last_reminder_time(run_time.isoformat())
+
     return f"✅ Reminder set for {run_time.strftime('%B %d at %I:%M %p UTC')}: '{message}'"
+
+
+def _patch_last_reminder_time(iso_time: str):
+    """Replace the 'time' field of the last line in reminders.json with an ISO timestamp."""
+    path = "/data/reminders/reminders.json"
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        lines = f.readlines()
+    if not lines:
+        return
+    try:
+        last = json.loads(lines[-1])
+        last["time"] = iso_time
+        lines[-1] = json.dumps(last) + "\n"
+        with open(path, "w") as f:
+            f.writelines(lines)
+    except Exception:
+        pass
+
+
+def reload_reminders_from_file():
+    """Re-schedule any future reminders saved to disk (e.g. after a restart)."""
+    path = "/data/reminders/reminders.json"
+    if not os.path.exists(path):
+        return
+    now = datetime.now(timezone.utc)
+    loaded = 0
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+                user_id = r.get("user_id", 0)
+                if not user_id:
+                    continue
+                run_time = parse_reminder_time(r["time"])
+                if run_time is None or run_time <= now:
+                    continue  # already past
+                job_id = f"reminder_{user_id}_{run_time.timestamp()}"
+                if not scheduler.get_job(job_id):
+                    scheduler.add_job(
+                        fire_reminder,
+                        trigger=DateTrigger(run_date=run_time),
+                        args=[user_id, r["message"]],
+                        id=job_id
+                    )
+                    loaded += 1
+            except Exception as e:
+                print(f"Skipping bad reminder entry: {e}")
+    if loaded:
+        print(f"Reloaded {loaded} pending reminder(s) from disk.")
 
 
 # --- Bot Events ---
 @bot.event
 async def on_ready():
     scheduler.start()
+    reload_reminders_from_file()
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     print("Scheduler started.")
 
