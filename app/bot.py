@@ -1,27 +1,31 @@
 import discord
 import os
-import json
 import re
 import httpx
+import logging
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
-from app.assistant import chat, set_reminder
+from app.assistant import chat, pending_gifs
 from app.memory import ConversationMemory
+import app.reminders as reminders
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
 
 # --- Memory ---
 user_memories: dict[int, ConversationMemory] = {}
 
 def get_memory(user_id: int) -> ConversationMemory:
+    # Return the conversation memory for a user, creating it if it doesn't exist yet.
     if user_id not in user_memories:
         user_memories[user_id] = ConversationMemory()
     return user_memories[user_id]
 
 
-# --- Bot + Scheduler Setup ---
+# --- Bot + Scheduler ---
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -29,170 +33,117 @@ bot = discord.Client(intents=intents)
 scheduler = AsyncIOScheduler()
 
 
-# --- Reminder Firing ---
+# --- Reminders ---
 async def fire_reminder(user_id: int, message: str):
+    # Called by the scheduler at the reminder's scheduled time — sends a DM to the user.
     try:
         user = await bot.fetch_user(user_id)
         await user.send(f"⏰ **Reminder:** {message}")
     except Exception as e:
-        print(f"Failed to send reminder to {user_id}: {e}")
+        log.error("Failed to send reminder to %d: %s", user_id, e)
 
 
 def parse_reminder_time(time_str: str) -> datetime | None:
-    """
-    Parses time strings like '3pm', '15:00', 'in 10 minutes', '2024-12-25 09:00'.
-    Returns a timezone-aware datetime or None if parsing fails.
-    """
+    # Parse a human-readable time string into a UTC-aware datetime.
+    # Supports relative ("in 10 minutes"), ISO timestamps, and clock times ("3pm", "15:30").
     now = datetime.now(timezone.utc)
     normalized = time_str.strip().lower()
-    # Strip trailing timezone labels like "utc"
     normalized = re.sub(r'\s*utc$', '', normalized).strip()
 
-    # Relative: "in X minute(s)/hour(s)/second(s)" or "X minutes/hours"
-    rel_match = re.match(r'(?:in\s+)?(\d+)\s*(second|minute|hour)s?', normalized)
-    if rel_match:
-        amount = int(rel_match.group(1))
-        unit = rel_match.group(2)
+    # Relative: "in X minutes/hours/seconds" or "X minutes"
+    rel = re.match(r'(?:in\s+)?(\d+)\s*(second|minute|hour)s?', normalized)
+    if rel:
+        amount = int(rel.group(1))
+        unit = rel.group(2)
         delta = {'second': timedelta(seconds=amount), 'minute': timedelta(minutes=amount), 'hour': timedelta(hours=amount)}[unit]
         return now + delta
 
-    # Full datetime with optional seconds: "2024-12-25T09:00:00+00:00" or "2024-12-25 09:00"
+    # ISO / full datetime
     for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
             dt = datetime.strptime(normalized, fmt)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
         except ValueError:
             pass
 
-    # "3pm", "3:30pm", "15:00", "15:30"
-    match = re.match(r'^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$', normalized)
-    if match:
-        hour = int(match.group(1))
-        minute = int(match.group(2)) if match.group(2) else 0
-        period = match.group(3)
-
+    # Clock time: "3pm", "3:30pm", "15:00"
+    m = re.match(r'^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$', normalized)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2) or 0)
+        period = m.group(3)
         if period == "pm" and hour != 12:
             hour += 12
         elif period == "am" and hour == 12:
             hour = 0
-
         dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if dt < now:
-            dt = dt + timedelta(days=1)
+            dt += timedelta(days=1)
         return dt
 
     return None
 
 
 def schedule_reminder(user_id: int, message: str, time_str: str) -> str:
-    """Parse time and schedule the reminder job."""
+    # Parse the time string and register a one-shot scheduler job to DM the user.
+    # Also patches the saved reminder file with the resolved ISO time for restart recovery.
     run_time = parse_reminder_time(time_str)
     if not run_time:
-        return f"Couldn't parse time '{time_str}'. Try formats like '3pm', '15:30', 'in 10 minutes', or '2024-12-25 09:00'."
+        return f"Couldn't parse time '{time_str}'. Try '3pm', 'in 10 minutes', or '2024-12-25 09:00'."
 
     job_id = f"reminder_{user_id}_{run_time.timestamp()}"
-    scheduler.add_job(
-        fire_reminder,
-        trigger=DateTrigger(run_date=run_time),
-        args=[user_id, message],
-        id=job_id
-    )
-
-    # Overwrite the last entry's time with the resolved ISO timestamp so
-    # reload_reminders_from_file can reschedule correctly after a restart.
-    _patch_last_reminder_time(run_time.isoformat())
-
+    scheduler.add_job(fire_reminder, trigger=DateTrigger(run_date=run_time), args=[user_id, message], id=job_id)
+    reminders.patch_last_time(run_time.isoformat())
     return f"✅ Reminder set for {run_time.strftime('%B %d at %I:%M %p UTC')}: '{message}'"
 
 
-def _patch_last_reminder_time(iso_time: str):
-    """Replace the 'time' field of the last line in reminders.json with an ISO timestamp."""
-    path = "/data/reminders/reminders.json"
-    if not os.path.exists(path):
-        return
-    with open(path) as f:
-        lines = f.readlines()
-    if not lines:
-        return
-    try:
-        last = json.loads(lines[-1])
-        last["time"] = iso_time
-        lines[-1] = json.dumps(last) + "\n"
-        with open(path, "w") as f:
-            f.writelines(lines)
-    except Exception:
-        pass
-
-
-def reload_reminders_from_file():
-    """Re-schedule any future reminders saved to disk (e.g. after a restart)."""
-    path = "/data/reminders/reminders.json"
-    if not os.path.exists(path):
-        return
+def reload_reminders():
+    # On startup, re-schedule any future reminders saved to disk so they survive container restarts.
     now = datetime.now(timezone.utc)
     loaded = 0
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                r = json.loads(line)
-                user_id = r.get("user_id", 0)
-                if not user_id:
-                    continue
-                run_time = parse_reminder_time(r["time"])
-                if run_time is None or run_time <= now:
-                    continue  # already past
-                job_id = f"reminder_{user_id}_{run_time.timestamp()}"
-                if not scheduler.get_job(job_id):
-                    scheduler.add_job(
-                        fire_reminder,
-                        trigger=DateTrigger(run_date=run_time),
-                        args=[user_id, r["message"]],
-                        id=job_id
-                    )
-                    loaded += 1
-            except Exception as e:
-                print(f"Skipping bad reminder entry: {e}")
+    for r in reminders.load():
+        user_id = r.get("user_id", 0)
+        if not user_id:
+            continue
+        run_time = parse_reminder_time(r["time"])
+        if not run_time or run_time <= now:
+            continue
+        job_id = f"reminder_{user_id}_{run_time.timestamp()}"
+        if not scheduler.get_job(job_id):
+            scheduler.add_job(fire_reminder, trigger=DateTrigger(run_date=run_time), args=[user_id, r["message"]], id=job_id)
+            loaded += 1
     if loaded:
-        print(f"Reloaded {loaded} pending reminder(s) from disk.")
+        log.info("Reloaded %d pending reminder(s) from disk.", loaded)
 
 
 # --- Bot Events ---
 @bot.event
 async def on_ready():
     scheduler.start()
-    reload_reminders_from_file()
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    print("Scheduler started.")
+    reload_reminders()
+    log.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
 
 
 @bot.event
 async def on_message(message: discord.Message):
+    # Main message handler. Processes !pm/!purge commands first (no mention needed),
+    # then handles bot mentions and DMs for AI responses and other commands.
     if message.author == bot.user:
         return
 
-    # Strip bot mention from the front so "!pm" and "@Meemaw !pm" both work
+    # !pm / !purge — works with or without @mention, in any channel
     raw = re.sub(r"<@!?\d+>\s*", "", message.content).strip()
-
     if raw.lower().startswith("!pm") or raw.lower().startswith("!purge"):
         try:
-            member = message.author
-            if hasattr(message.guild, 'fetch_member'):
-                member = await message.guild.fetch_member(message.author.id)
-            has_permission = any(r.name.lower() == "clams" for r in member.roles)
+            member = await message.guild.fetch_member(message.author.id)
+            has_perm = any(r.name.lower() == "clams" for r in member.roles)
         except Exception:
-            has_permission = False
-        if not has_permission:
+            has_perm = False
+        if not has_perm:
             await message.channel.send("❌ You need the `clams` role to use this command.")
             return
         parts = raw.split()
         try:
-            limit = int(parts[1]) if len(parts) > 1 else 100
-            limit = min(limit, 500)
+            limit = min(int(parts[1]) if len(parts) > 1 else 100, 500)
         except ValueError:
             limit = 100
 
@@ -200,8 +151,8 @@ async def on_message(message: discord.Message):
             return (
                 m.author == bot.user or
                 "meemaw" in m.content.lower() or
-                bot.user in m.mentions or
-                "@meemaw" in m.content.lower()
+                "@meemaw" in m.content.lower() or
+                bot.user in m.mentions
             )
 
         try:
@@ -222,12 +173,10 @@ async def on_message(message: discord.Message):
 
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_mentioned = bot.user in message.mentions
-
     if not (is_dm or is_mentioned):
         return
 
     content = message.content.replace(f"<@{bot.user.id}>", "").strip()
-
     if not content:
         await message.reply("Yes? How can I help?")
         return
@@ -235,55 +184,33 @@ async def on_message(message: discord.Message):
     async with message.channel.typing():
         memory = get_memory(message.author.id)
 
+        # --- Commands ---
         if content.lower() in ("!clear", "clear"):
             memory.clear()
             await message.reply("Memory cleared!")
             return
 
         if content.lower() in ("!clearreminders", "clearreminders"):
-            user_jobs = [j for j in scheduler.get_jobs() if str(message.author.id) in j.id]
-            for j in user_jobs:
+            jobs = [j for j in scheduler.get_jobs() if str(message.author.id) in j.id]
+            for j in jobs:
                 j.remove()
-            # Remove from file
-            path = "/data/reminders/reminders.json"
-            if os.path.exists(path):
-                remaining = []
-                with open(path) as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            r = json.loads(line)
-                            if str(r.get("user_id", "")) != str(message.author.id):
-                                remaining.append(line)
-                        except Exception:
-                            pass
-                with open(path, "w") as f:
-                    f.write("\n".join(remaining) + ("\n" if remaining else ""))
-            await message.reply(f"🗑️ Cleared {len(user_jobs)} reminder(s).")
+            removed = reminders.clear(message.author.id)
+            await message.reply(f"🗑️ Cleared {max(len(jobs), removed)} reminder(s).")
             return
 
         if content.lower() in ("!reminders", "reminders"):
-            jobs = scheduler.get_jobs()
-            user_jobs = [j for j in jobs if str(message.author.id) in j.id]
-            if not user_jobs:
+            jobs = [j for j in scheduler.get_jobs() if str(message.author.id) in j.id]
+            if not jobs:
                 await message.reply("You have no pending reminders.")
             else:
-                lines = [
-                    f"⏰ {j.next_run_time.strftime('%B %d at %I:%M %p UTC')} — {j.args[1]}"
-                    for j in user_jobs
-                ]
+                lines = [f"⏰ {j.next_run_time.strftime('%B %d at %I:%M %p UTC')} — {j.args[1]}" for j in jobs]
                 await message.reply("**Your reminders:**\n" + "\n".join(lines))
             return
 
         if content.lower() in ("!joke", "joke"):
             try:
                 async with httpx.AsyncClient(timeout=10) as client:
-                    r = await client.get(
-                        "https://v2.jokeapi.dev/joke/Any",
-                        params={"blacklistFlags": "", "safe-mode": False}
-                    )
+                    r = await client.get("https://v2.jokeapi.dev/joke/Any", params={"safe-mode": False})
                 data = r.json()
                 if data.get("type") == "twopart":
                     await message.reply(f"{data['setup']}\n\n||{data['delivery']}||")
@@ -295,19 +222,29 @@ async def on_message(message: discord.Message):
                 await message.reply(f"Joke fetch failed: {e}")
             return
 
+        # --- AI Response ---
         memory.add_user(content)
-        response = chat(memory.get_history(), user_id=message.author.id)  # ← pass user_id
+        response = chat(memory.get_history(), user_id=message.author.id)
         memory.add_assistant(response)
 
-    await send_response(message, response)
+    await send_response(message, response, user_id=message.author.id)
 
 
-async def send_response(message: discord.Message, response: str):
+async def send_response(message: discord.Message, response: str, user_id: int = 0):
+    # Send the bot's reply. If a GIF embed was queued during the tool call, send that instead.
+    # Splits long responses into 1990-char chunks to stay under Discord's 2000-char limit.
+    # Send GIF embed if one was queued during the tool call
+    if user_id in pending_gifs:
+        title, url = pending_gifs.pop(user_id)
+        embed = discord.Embed(title=title, url=url)
+        embed.set_image(url=url)
+        await message.reply(embed=embed)
+        return
+
     if len(response) <= 2000:
         await message.reply(response)
     else:
-        chunks = [response[i:i+1990] for i in range(0, len(response), 1990)]
-        for chunk in chunks:
+        for chunk in [response[i:i+1990] for i in range(0, len(response), 1990)]:
             await message.channel.send(chunk)
 
 

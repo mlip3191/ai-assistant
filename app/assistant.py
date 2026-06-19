@@ -1,15 +1,16 @@
 import anthropic
 import os
-import json
+import logging
 from datetime import datetime
 
+log = logging.getLogger(__name__)
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-SYSTEM_PROMPT = """You are a concise personal assistant. You have access to tools for checking weather, setting and clearing reminders, looking up stock/ETF/crypto prices, getting live sports scores, searching the web, sending GIFs, and searching files. Keep responses brief and to the point. No unnecessary filler or repetition.
+SYSTEM_PROMPT = """You are a concise personal assistant. You have access to tools for checking weather, setting and clearing reminders, looking up stock/ETF/crypto prices, getting live sports scores, sending GIFs, and searching the web and files. Keep responses brief and to the point. No unnecessary filler or repetition.
 
-IMPORTANT: Never answer questions about live or current data (scores, prices, weather, news, recent events) from memory or training data. Always call the appropriate tool first. Your training data is outdated — use web_search for anything current or factual you are unsure about."""
+IMPORTANT: Never answer questions about live or current data (scores, prices, weather, news, recent events) from memory or training data. Always call the appropriate tool first. Your training data is outdated — use web_search for anything current or factual you are unsure about. You CAN send GIFs — always call get_gif when asked."""
 
-# --- Tool Definitions (sent to Claude) ---
+# Tool schemas sent to Claude so it knows what tools are available and when to call them.
 TOOLS = [
     {
         "name": "get_weather",
@@ -17,10 +18,7 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "city": {
-                    "type": "string",
-                    "description": "The city name, e.g. 'London' or 'New York'"
-                }
+                "city": {"type": "string", "description": "The city name, e.g. 'London' or 'New York'"}
             },
             "required": ["city"]
         }
@@ -31,17 +29,16 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "message": {
-                    "type": "string",
-                    "description": "The reminder message"
-                },
-                "time": {
-                    "type": "string",
-                    "description": "When to remind, e.g. '3pm' or '2024-12-25 09:00'"
-                }
+                "message": {"type": "string", "description": "The reminder message"},
+                "time": {"type": "string", "description": "When to remind, e.g. '3pm', 'in 10 minutes', or '2024-12-25 09:00'"}
             },
             "required": ["message", "time"]
         }
+    },
+    {
+        "name": "clear_reminders",
+        "description": "Clear all pending reminders for the current user. Use when the user asks to delete, remove, or clear their reminders.",
+        "input_schema": {"type": "object", "properties": {}, "required": []}
     },
     {
         "name": "get_price",
@@ -49,33 +46,18 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Ticker symbol or company/asset name, e.g. 'AAPL', 'Apple', 'SPY', 'Bitcoin', 'BTC-USD'"
-                }
+                "query": {"type": "string", "description": "Ticker symbol or company/asset name"}
             },
             "required": ["query"]
         }
     },
     {
-        "name": "clear_reminders",
-        "description": "Clear all pending reminders for the current user. Use when the user asks to delete, remove, or clear their reminders.",
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-            "required": []
-        }
-    },
-    {
         "name": "get_score",
-        "description": "Get live or recent sports scores from ESPN. ALWAYS call this tool for any sports score question — never answer from memory or training data. To get all games in a league (e.g. 'World Cup scores', 'NBA scores today'), pass only the league. To look up a specific team, pass the team name. Use league='worldcup' for FIFA World Cup 2026 scores.",
+        "description": "Get live or recent sports scores from ESPN. ALWAYS call this tool for any sports score question — never answer from memory. To get all games in a league (e.g. 'World Cup scores', 'NBA scores today'), pass only the league. To look up a specific team, pass the team name. Use league='worldcup' for FIFA World Cup 2026 scores.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "team": {
-                    "type": "string",
-                    "description": "Team name or city to filter by, e.g. 'Lakers', 'Chiefs', 'USA', 'Mexico'. Omit to get all games in the league."
-                },
+                "team": {"type": "string", "description": "Team name or city, e.g. 'Lakers', 'Chiefs', 'USA'. Omit to get all games in the league."},
                 "league": {
                     "type": "string",
                     "description": "League: nfl, nba, mlb, nhl, ncaaf, ncaab, wcbb, wnba, college-baseball, mls, epl, ucl, worldcup",
@@ -87,28 +69,22 @@ TOOLS = [
     },
     {
         "name": "get_gif",
-        "description": "Search Giphy and return a GIF URL. You MUST call this tool whenever the user asks for a GIF — do not say you cannot send GIFs. Always call this tool and return the URL.",
+        "description": "Search Giphy and return a GIF. You MUST call this tool whenever the user asks for a GIF — do not say you cannot send GIFs.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search term for the GIF, e.g. 'excited cat', 'facepalm', 'celebration'"
-                }
+                "query": {"type": "string", "description": "Search term, e.g. 'excited cat', 'celebration'"}
             },
             "required": ["query"]
         }
     },
     {
         "name": "web_search",
-        "description": "Search the internet for current information, news, facts, or anything not covered by other tools. Use this for general knowledge questions, recent events, or anything that requires up-to-date information.",
+        "description": "Search the internet for current information, news, or facts. Use for anything not covered by other tools.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The search query, e.g. 'latest iPhone release date' or 'who is the president of France'"
-                }
+                "query": {"type": "string", "description": "The search query"}
             },
             "required": ["query"]
         }
@@ -119,10 +95,7 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Filename or extension to search for, e.g. 'report' or '.pdf'"
-                }
+                "query": {"type": "string", "description": "Filename or extension to search for"}
             },
             "required": ["query"]
         }
@@ -130,9 +103,10 @@ TOOLS = [
 ]
 
 
-# --- Actual Tool Implementations ---
+# --- Tool Implementations ---
 
 def get_weather(city: str) -> str:
+    # Fetch current weather conditions for a city from OpenWeatherMap.
     import httpx
     api_key = os.getenv("OPENWEATHER_API_KEY")
     try:
@@ -143,21 +117,22 @@ def get_weather(city: str) -> str:
         )
         data = r.json()
         if data.get("cod") != 200:
-            return f"Couldn't find weather for '{city}'. Try a different city name."
+            return f"Couldn't find weather for '{city}'."
         desc = data["weather"][0]["description"].capitalize()
         temp = data["main"]["temp"]
         feels = data["main"]["feels_like"]
         humidity = data["main"]["humidity"]
         return f"{city.title()}: {desc}, {temp}°C (feels like {feels}°C), humidity {humidity}%"
     except Exception as e:
-        return f"Weather lookup failed: {str(e)}"
+        return f"Weather lookup failed: {e}"
 
 
 def get_price(query: str) -> str:
+    # Look up the current price and daily change for a stock, ETF, or crypto via yfinance.
+    # Accepts either a ticker symbol (AAPL) or a common name (Apple) via the NAME_MAP lookup.
     import yfinance as yf
     from datetime import date
 
-    # Common name → ticker mappings for popular assets
     NAME_MAP = {
         "apple": "AAPL", "microsoft": "MSFT", "google": "GOOGL", "alphabet": "GOOGL",
         "amazon": "AMZN", "meta": "META", "facebook": "META", "nvidia": "NVDA",
@@ -170,125 +145,67 @@ def get_price(query: str) -> str:
         "solana": "SOL-USD", "sol": "SOL-USD",
     }
 
-    ticker_symbol = NAME_MAP.get(query.strip().lower()) or query.strip().upper()
-
+    symbol = NAME_MAP.get(query.strip().lower()) or query.strip().upper()
     try:
-        ticker = yf.Ticker(ticker_symbol)
+        ticker = yf.Ticker(symbol)
         info = ticker.fast_info
-
-        current_price = info.last_price
-        prev_close = info.previous_close
-
-        if current_price is None or prev_close is None:
-            return f"Couldn't retrieve price data for '{query}'. Check the ticker symbol and try again."
-
-        change = current_price - prev_close
-        change_pct = (change / prev_close) * 100
+        current = info.last_price
+        prev = info.previous_close
+        if current is None or prev is None:
+            return f"Couldn't retrieve price data for '{query}'."
+        change = current - prev
+        pct = (change / prev) * 100
         direction = "▲" if change >= 0 else "▼"
-
-        # Prefer longName from .info, fall back to ticker symbol
-        full_info = ticker.info
-        company = full_info.get("longName") or full_info.get("shortName") or ticker_symbol
-
+        company = ticker.info.get("longName") or ticker.info.get("shortName") or symbol
         today = date.today().strftime("%B %d, %Y")
-
         return (
-            f"**{company} ({ticker_symbol})**\n"
+            f"**{company} ({symbol})**\n"
             f"Date: {today}\n"
-            f"Price: ${current_price:,.2f}\n"
-            f"Change: {direction} ${abs(change):,.2f} ({'+' if change >= 0 else ''}{change_pct:.2f}%)"
+            f"Price: ${current:,.2f}\n"
+            f"Change: {direction} ${abs(change):,.2f} ({'+' if change >= 0 else ''}{pct:.2f}%)"
         )
     except Exception as e:
-        return f"Price lookup failed for '{query}': {str(e)}"
+        return f"Price lookup failed for '{query}': {e}"
 
 
-def get_gif(query: str) -> str:
-    import httpx
-    import random
-    api_key = os.getenv("GIPHY_API_KEY")
-    if not api_key:
-        return "GIF search is not configured. Set GIPHY_API_KEY in .env."
-    try:
-        r = httpx.get(
-            "https://api.giphy.com/v1/gifs/search",
-            params={"api_key": api_key, "q": query, "limit": 25, "rating": "pg-13"},
-            timeout=5
-        )
-        r.raise_for_status()
-        data = r.json()
-        gifs = data.get("data", [])
-        if not gifs:
-            return f"No GIF found for '{query}'."
-        gif = random.choice(gifs)
-        return gif["images"]["original"]["url"]
-    except Exception as e:
-        return f"GIF search failed: {str(e)}"
+def set_reminder(message: str, time: str, user_id: int = 0) -> str:
+    # Save a reminder to disk and schedule a Discord DM if a user_id is provided.
+    import app.reminders as reminders
+    reminder = {
+        "user_id": user_id,
+        "message": message,
+        "time": time,
+        "created_at": datetime.now().isoformat()
+    }
+    reminders.save(reminder)
 
+    if user_id:
+        from app.bot import schedule_reminder
+        return schedule_reminder(user_id, message, time)
 
-def web_search(query: str) -> str:
-    import httpx
-    api_key = os.getenv("BRAVE_API_KEY")
-    if not api_key:
-        return "Web search is not configured. Set BRAVE_API_KEY in .env."
-    try:
-        r = httpx.get(
-            "https://api.search.brave.com/res/v1/web/search",
-            headers={"Accept": "application/json", "X-Subscription-Token": api_key},
-            params={"q": query, "count": 5},
-            timeout=8
-        )
-        r.raise_for_status()
-        data = r.json()
-        results = data.get("web", {}).get("results", [])
-        if not results:
-            return f"No results found for '{query}'."
-        lines = []
-        for r in results:
-            title = r.get("title", "")
-            desc = r.get("description", "")
-            url = r.get("url", "")
-            lines.append(f"**{title}**\n{desc}\n{url}")
-        return "\n\n".join(lines)
-    except Exception as e:
-        return f"Web search failed: {str(e)}"
+    return f"Reminder saved: '{message}' at {time}"
 
 
 def clear_reminders(user_id: int = 0) -> str:
+    # Remove all reminders for the user from disk and cancel any scheduled jobs.
+    import app.reminders as reminders
+    removed = reminders.clear(user_id)
+
     if user_id:
         from app.bot import scheduler
-        user_jobs = [j for j in scheduler.get_jobs() if str(user_id) in j.id]
-        for j in user_jobs:
+        jobs = [j for j in scheduler.get_jobs() if str(user_id) in j.id]
+        for j in jobs:
             j.remove()
-        count = len(user_jobs)
-    else:
-        count = 0
+        removed = max(removed, len(jobs))
 
-    path = "/data/reminders/reminders.json"
-    if os.path.exists(path):
-        if user_id:
-            remaining = []
-            with open(path) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        r = json.loads(line)
-                        if str(r.get("user_id", "")) != str(user_id):
-                            remaining.append(line)
-                    except Exception:
-                        pass
-            with open(path, "w") as f:
-                f.write("\n".join(remaining) + ("\n" if remaining else ""))
-        else:
-            open(path, "w").close()
-
-    return f"✅ Cleared {count} reminder(s)."
+    return f"✅ Cleared {removed} reminder(s)."
 
 
 def get_score(team: str = None, league: str = None) -> str:
+    # Fetch live or recent scores from the ESPN hidden API.
+    # If team is given, searches all relevant leagues for that team's game.
+    # If only league is given, returns all current games in that league.
     import httpx
-    from datetime import datetime
 
     LEAGUES = {
         "nfl":              ("football",   "nfl"),
@@ -309,42 +226,36 @@ def get_score(team: str = None, league: str = None) -> str:
     search_leagues = [LEAGUES[league]] if league and league in LEAGUES else list(LEAGUES.values())
     team_lower = team.strip().lower() if team else None
 
-    def fetch_scoreboard(sport, slug):
-        url = f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{slug}/scoreboard"
-        r = httpx.get(url, timeout=8)
+    def fetch(sport, slug):
+        r = httpx.get(
+            f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{slug}/scoreboard",
+            timeout=8
+        )
         r.raise_for_status()
         return r.json()
 
-    def format_game(event: dict, comp: dict, slug: str) -> str:
+    def format_game(event, comp, slug):
         status = comp.get("status", {})
         state = status.get("type", {}).get("state", "")
         detail = status.get("type", {}).get("shortDetail", "")
-
         competitors = comp.get("competitors", [])
         if len(competitors) < 2:
             return None
 
         home = next((c for c in competitors if c.get("homeAway") == "home"), competitors[0])
         away = next((c for c in competitors if c.get("homeAway") == "away"), competitors[1])
-
         home_name = home.get("team", {}).get("displayName", "Home")
         away_name = away.get("team", {}).get("displayName", "Away")
         home_score = home.get("score", "—")
         away_score = away.get("score", "—")
+        home_label = f"**{home_name}**" if home.get("winner") else home_name
+        away_label = f"**{away_name}**" if away.get("winner") else away_name
 
-        home_win = home.get("winner", False)
-        away_win = away.get("winner", False)
-        home_label = f"**{home_name}**" if home_win else home_name
-        away_label = f"**{away_name}**" if away_win else away_name
-
-        score_line = f"{away_label} {away_score} @ {home_label} {home_score}"
-
-        date_str = event.get("date", "")
         try:
-            dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(event.get("date", "").replace("Z", "+00:00"))
             game_time = dt.strftime("%B %d, %Y at %I:%M %p UTC")
         except Exception:
-            game_time = date_str
+            game_time = event.get("date", "")
 
         if state == "in":
             status_line = f"🔴 LIVE — {detail}"
@@ -354,77 +265,99 @@ def get_score(team: str = None, league: str = None) -> str:
             status_line = f"🕐 Upcoming — {detail}"
 
         league_label = slug.upper().replace("-", " ").replace(".", " ")
-        return f"**{league_label}** | {event.get('shortName', event.get('name', ''))}\n📅 {game_time}\n{status_line}\n{score_line}"
+        return (
+            f"**{league_label}** | {event.get('shortName', event.get('name', ''))}\n"
+            f"📅 {game_time}\n"
+            f"{status_line}\n"
+            f"{away_label} {away_score} @ {home_label} {home_score}"
+        )
 
     try:
         results = []
         for sport, slug in search_leagues:
             try:
-                data = fetch_scoreboard(sport, slug)
+                data = fetch(sport, slug)
             except Exception:
                 continue
-
             for event in data.get("events", []):
                 for comp in event.get("competitions", []):
                     if team_lower:
-                        competitors = comp.get("competitors", [])
                         searchable = []
-                        for c in competitors:
+                        for c in comp.get("competitors", []):
                             t = c.get("team", {})
-                            searchable += [
-                                t.get("displayName", ""),
-                                t.get("shortDisplayName", ""),
-                                t.get("location", ""),
-                                t.get("name", ""),
-                                t.get("abbreviation", ""),
-                            ]
+                            searchable += [t.get("displayName", ""), t.get("shortDisplayName", ""),
+                                           t.get("location", ""), t.get("name", ""), t.get("abbreviation", "")]
                         if not any(team_lower in n.lower() for n in searchable if n):
                             continue
                     formatted = format_game(event, comp, slug)
                     if formatted:
                         results.append(formatted)
                         if team_lower:
-                            return formatted  # return immediately for specific team lookup
-
+                            return formatted
         if results:
             return "\n\n".join(results)
-
         if team_lower:
-            return f"No current or recent game found for '{team}'. The season may be off or try a different spelling."
+            return f"No current or recent game found for '{team}'."
         return "No games currently found."
     except Exception as e:
-        return f"Score lookup failed: {str(e)}"
+        return f"Score lookup failed: {e}"
 
 
-def set_reminder(message: str, time: str, user_id: int = 0) -> str:
-    reminder = {
-        "user_id": user_id,
-        "message": message,
-        "time": time,
-        "created_at": datetime.now().isoformat()
-    }
-    os.makedirs("/data/reminders", exist_ok=True)
-    with open("/data/reminders/reminders.json", "a") as f:
-        f.write(json.dumps(reminder) + "\n")
+def get_gif(query: str) -> str:
+    # Search Giphy for a GIF matching the query and return a GIF_EMBED:: protocol string.
+    # The bot intercepts this string and sends a Discord embed instead of plain text.
+    import httpx
+    import random
+    api_key = os.getenv("GIPHY_API_KEY")
+    if not api_key:
+        return "GIF search is not configured. Set GIPHY_API_KEY in .env."
+    try:
+        r = httpx.get(
+            "https://api.giphy.com/v1/gifs/search",
+            params={"api_key": api_key, "q": query, "limit": 25, "rating": "pg-13"},
+            timeout=5
+        )
+        r.raise_for_status()
+        gifs = r.json().get("data", [])
+        if not gifs:
+            return f"No GIF found for '{query}'."
+        gif = random.choice(gifs)
+        url = gif["images"]["original"]["url"]
+        return f"GIF_EMBED::{query}::{url}"
+    except Exception as e:
+        return f"GIF search failed: {e}"
 
-    if user_id:
-        from app.bot import schedule_reminder
-        return schedule_reminder(user_id, message, time)
 
-    return f"Reminder saved: '{message}' at {time}"
+def web_search(query: str) -> str:
+    # Search the web via Brave Search API and return the top 5 results as formatted text.
+    import httpx
+    api_key = os.getenv("BRAVE_API_KEY")
+    if not api_key:
+        return "Web search is not configured. Set BRAVE_API_KEY in .env."
+    try:
+        r = httpx.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            headers={"Accept": "application/json", "X-Subscription-Token": api_key},
+            params={"q": query, "count": 5},
+            timeout=8
+        )
+        r.raise_for_status()
+        results = r.json().get("web", {}).get("results", [])
+        if not results:
+            return f"No results found for '{query}'."
+        lines = [f"**{r['title']}**\n{r.get('description', '')}\n{r.get('url', '')}" for r in results]
+        return "\n\n".join(lines)
+    except Exception as e:
+        return f"Web search failed: {e}"
 
 
 def search_files(query: str) -> str:
+    # Recursively search /data for files whose names contain the query string.
     results = []
-    search_root = "/data"
-    os.makedirs(search_root, exist_ok=True)
-
-    for root, dirs, files in os.walk(search_root):
+    for root, _, files in os.walk("/data"):
         for filename in files:
             if query.lower() in filename.lower():
-                full_path = os.path.join(root, filename)
-                results.append(full_path)
-
+                results.append(os.path.join(root, filename))
     if not results:
         return f"No files found matching '{query}'"
     return "Found files:\n" + "\n".join(results)
@@ -432,80 +365,65 @@ def search_files(query: str) -> str:
 
 # --- Tool Router ---
 
-def run_tool(tool_name: str, tool_input: dict) -> str:
-    if tool_name == "get_weather":
-        return get_weather(**tool_input)
-    elif tool_name == "get_price":
-        return get_price(**tool_input)
-    elif tool_name == "get_score":
-        return get_score(**tool_input)
-    elif tool_name == "get_gif":
-        return get_gif(**tool_input)
-    elif tool_name == "web_search":
-        return web_search(**tool_input)
-    elif tool_name == "set_reminder":
-        return set_reminder(**tool_input)
-    elif tool_name == "search_files":
-        return search_files(**tool_input)
-    else:
-        return f"Unknown tool: {tool_name}"
+def run_tool(tool_name: str, tool_input: dict, user_id: int = 0) -> str:
+    # Dispatch a tool call by name. user_id is passed through to tools that need it (reminders, GIFs).
+    if tool_name == "get_weather":        return get_weather(**tool_input)
+    if tool_name == "set_reminder":       return set_reminder(**tool_input, user_id=user_id)
+    if tool_name == "clear_reminders":    return clear_reminders(user_id=user_id)
+    if tool_name == "get_price":          return get_price(**tool_input)
+    if tool_name == "get_score":          return get_score(**tool_input)
+    if tool_name == "get_gif":            return get_gif(**tool_input)
+    if tool_name == "web_search":         return web_search(**tool_input)
+    if tool_name == "search_files":       return search_files(**tool_input)
+    return f"Unknown tool: {tool_name}"
 
 
-# --- Model Picker ---
+# --- Chat Loop ---
 
-def pick_model(message: str) -> str:
-    if len(message.split()) < 15:
-        return "claude-haiku-4-5-20251001"
-    return "claude-sonnet-4-6"
+# Pending GIF embeds keyed by user_id. When get_gif fires, the (title, url) tuple is stored
+# here instead of returned as text. bot.py checks this after chat() returns and sends the embed.
+pending_gifs: dict[int, tuple[str, str]] = {}
 
-
-# --- Main Chat Function (handles tool loop) ---
 
 def chat(conversation_history: list[dict], user_id: int = 0) -> str:
+    # Run the Claude tool-use loop. Sends the conversation to Claude, handles any tool calls,
+    # and returns the final text response. Loops until Claude stops calling tools.
     messages = list(conversation_history)
-    last_message = messages[-1]["content"]
 
     while True:
         response = client.messages.create(
-            model=pick_model(last_message),
+            model="claude-sonnet-4-6",
             max_tokens=512,
             system=SYSTEM_PROMPT,
             tools=TOOLS,
             messages=messages
         )
-
-        print(f"Tokens — input: {response.usage.input_tokens}, output: {response.usage.output_tokens}, total: {response.usage.input_tokens + response.usage.output_tokens}")
+        log.info("Tokens — input: %d, output: %d", response.usage.input_tokens, response.usage.output_tokens)
 
         if response.stop_reason == "end_turn":
-            text_blocks = [b.text for b in response.content if hasattr(b, "text")]
-            return "\n".join(text_blocks)
+            return "\n".join(b.text for b in response.content if hasattr(b, "text"))
 
         if response.stop_reason == "tool_use":
             messages.append({"role": "assistant", "content": response.content})
-
             tool_results = []
             for block in response.content:
-                if block.type == "tool_use":
-                    # Handle set_reminder with user_id
-                    if block.name == "set_reminder":
-                        result = set_reminder(
-                            message=block.input["message"],
-                            time=block.input["time"],
-                            user_id=user_id
-                        )
-                    elif block.name == "clear_reminders":
-                        result = clear_reminders(user_id=user_id)
-                    else:
-                        result = run_tool(block.name, block.input)
+                if block.type != "tool_use":
+                    continue
+                result = run_tool(block.name, block.input, user_id=user_id)
 
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result
-                    })
+                # Intercept GIF embeds so bot.py can send them as Discord embeds
+                if result.startswith("GIF_EMBED::"):
+                    parts = result.split("::", 2)
+                    if len(parts) == 3:
+                        pending_gifs[user_id] = (parts[1], parts[2])
+                    result = "📬 Here's your GIF!"
 
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result
+                })
             messages.append({"role": "user", "content": tool_results})
-
         else:
             break
 
