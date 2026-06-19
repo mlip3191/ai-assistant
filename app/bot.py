@@ -39,21 +39,31 @@ async def fire_reminder(user_id: int, message: str):
 
 def parse_reminder_time(time_str: str) -> datetime | None:
     """
-    Parses time strings like '3pm', '15:00', '2024-12-25 09:00'.
+    Parses time strings like '3pm', '15:00', 'in 10 minutes', '2024-12-25 09:00'.
     Returns a timezone-aware datetime or None if parsing fails.
     """
-    now = datetime.now()
-    time_str = time_str.strip().lower()
+    now = datetime.now(timezone.utc)
+    normalized = time_str.strip().lower()
+    # Strip trailing timezone labels like "utc"
+    normalized = re.sub(r'\s*utc$', '', normalized).strip()
 
-    # Try full datetime format first: "2024-12-25 09:00"
+    # Relative: "in X minute(s)/hour(s)/second(s)" or "X minutes/hours"
+    rel_match = re.match(r'(?:in\s+)?(\d+)\s*(second|minute|hour)s?', normalized)
+    if rel_match:
+        amount = int(rel_match.group(1))
+        unit = rel_match.group(2)
+        delta = {'second': timedelta(seconds=amount), 'minute': timedelta(minutes=amount), 'hour': timedelta(hours=amount)}[unit]
+        return now + delta
+
+    # Full datetime: "2024-12-25 09:00"
     try:
-        dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
+        dt = datetime.strptime(normalized, "%Y-%m-%d %H:%M")
         return dt.replace(tzinfo=timezone.utc)
     except ValueError:
         pass
 
-    # Try "3pm" or "3:30pm" format
-    match = re.match(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", time_str)
+    # "3pm", "3:30pm", "15:00", "15:30"
+    match = re.match(r'^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$', normalized)
     if match:
         hour = int(match.group(1))
         minute = int(match.group(2)) if match.group(2) else 0
@@ -65,10 +75,9 @@ def parse_reminder_time(time_str: str) -> datetime | None:
             hour = 0
 
         dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        # If the time has already passed today, schedule for tomorrow
         if dt < now:
-            dt = dt.replace(day=dt.day + 1)
-        return dt.replace(tzinfo=timezone.utc)
+            dt = dt + timedelta(days=1)
+        return dt
 
     return None
 
@@ -77,7 +86,7 @@ def schedule_reminder(user_id: int, message: str, time_str: str) -> str:
     """Parse time and schedule the reminder job."""
     run_time = parse_reminder_time(time_str)
     if not run_time:
-        return f"Couldn't parse time '{time_str}'. Try formats like '3pm', '15:30', or '2024-12-25 09:00'."
+        return f"Couldn't parse time '{time_str}'. Try formats like '3pm', '15:30', 'in 10 minutes', or '2024-12-25 09:00'."
 
     scheduler.add_job(
         fire_reminder,
@@ -85,9 +94,6 @@ def schedule_reminder(user_id: int, message: str, time_str: str) -> str:
         args=[user_id, message],
         id=f"reminder_{user_id}_{run_time.timestamp()}"
     )
-
-    # Also save to file as backup
-    set_reminder(message, time_str, user_id)
 
     return f"✅ Reminder set for {run_time.strftime('%B %d at %I:%M %p UTC')}: '{message}'"
 

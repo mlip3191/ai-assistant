@@ -83,7 +83,6 @@ def get_weather(city: str) -> str:
 
 
 def set_reminder(message: str, time: str, user_id: int = 0) -> str:
-    # Save to file
     reminder = {
         "user_id": user_id,
         "message": message,
@@ -94,7 +93,6 @@ def set_reminder(message: str, time: str, user_id: int = 0) -> str:
     with open("/data/reminders/reminders.json", "a") as f:
         f.write(json.dumps(reminder) + "\n")
 
-    # Schedule the actual Discord DM if we have a user_id
     if user_id:
         from app.bot import schedule_reminder
         return schedule_reminder(user_id, message, time)
