@@ -5,7 +5,7 @@ from datetime import datetime
 
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-SYSTEM_PROMPT = """You are a concise personal assistant. You have access to tools for checking weather, setting and clearing reminders, looking up stock/ETF/crypto prices, getting live sports scores, searching the web, and searching files. Keep responses brief and to the point. No unnecessary filler or repetition.
+SYSTEM_PROMPT = """You are a concise personal assistant. You have access to tools for checking weather, setting and clearing reminders, looking up stock/ETF/crypto prices, getting live sports scores, searching the web, sending GIFs, and searching files. Keep responses brief and to the point. No unnecessary filler or repetition.
 
 IMPORTANT: Never answer questions about live or current data (scores, prices, weather, news, recent events) from memory or training data. Always call the appropriate tool first. Your training data is outdated — use web_search for anything current or factual you are unsure about."""
 
@@ -83,6 +83,20 @@ TOOLS = [
                 }
             },
             "required": []
+        }
+    },
+    {
+        "name": "get_gif",
+        "description": "Search Giphy and return a GIF URL. You MUST call this tool whenever the user asks for a GIF — do not say you cannot send GIFs. Always call this tool and return the URL.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search term for the GIF, e.g. 'excited cat', 'facepalm', 'celebration'"
+                }
+            },
+            "required": ["query"]
         }
     },
     {
@@ -186,6 +200,27 @@ def get_price(query: str) -> str:
         )
     except Exception as e:
         return f"Price lookup failed for '{query}': {str(e)}"
+
+
+def get_gif(query: str) -> str:
+    import httpx
+    api_key = os.getenv("GIPHY_API_KEY")
+    if not api_key:
+        return "GIF search is not configured. Set GIPHY_API_KEY in .env."
+    try:
+        r = httpx.get(
+            "https://api.giphy.com/v1/gifs/search",
+            params={"api_key": api_key, "q": query, "limit": 1, "rating": "pg-13"},
+            timeout=5
+        )
+        r.raise_for_status()
+        data = r.json()
+        gifs = data.get("data", [])
+        if not gifs:
+            return f"No GIF found for '{query}'."
+        return gifs[0]["images"]["original"]["url"]
+    except Exception as e:
+        return f"GIF search failed: {str(e)}"
 
 
 def web_search(query: str) -> str:
@@ -402,6 +437,8 @@ def run_tool(tool_name: str, tool_input: dict) -> str:
         return get_price(**tool_input)
     elif tool_name == "get_score":
         return get_score(**tool_input)
+    elif tool_name == "get_gif":
+        return get_gif(**tool_input)
     elif tool_name == "web_search":
         return web_search(**tool_input)
     elif tool_name == "set_reminder":
