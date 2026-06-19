@@ -24,6 +24,7 @@ def get_memory(user_id: int) -> ConversationMemory:
 # --- Bot + Scheduler Setup ---
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 bot = discord.Client(intents=intents)
 scheduler = AsyncIOScheduler()
 
@@ -174,6 +175,51 @@ async def on_message(message: discord.Message):
     if message.author == bot.user:
         return
 
+    # Strip bot mention from the front so "!pm" and "@Meemaw !pm" both work
+    raw = re.sub(r"<@!?\d+>\s*", "", message.content).strip()
+
+    if raw.lower().startswith("!pm") or raw.lower().startswith("!purge"):
+        try:
+            member = message.author
+            if hasattr(message.guild, 'fetch_member'):
+                member = await message.guild.fetch_member(message.author.id)
+            has_permission = any(r.name.lower() == "clams" for r in member.roles)
+        except Exception:
+            has_permission = False
+        if not has_permission:
+            await message.channel.send("❌ You need the `clams` role to use this command.")
+            return
+        parts = raw.split()
+        try:
+            limit = int(parts[1]) if len(parts) > 1 else 100
+            limit = min(limit, 500)
+        except ValueError:
+            limit = 100
+
+        def is_meemaw_related(m):
+            return (
+                m.author == bot.user or
+                "meemaw" in m.content.lower() or
+                bot.user in m.mentions or
+                "@meemaw" in m.content.lower()
+            )
+
+        try:
+            deleted = await message.channel.purge(limit=limit, check=is_meemaw_related)
+        except discord.Forbidden:
+            await message.channel.send("❌ Missing 'Manage Messages' permission in this channel.")
+            return
+        except Exception as e:
+            await message.channel.send(f"❌ Purge failed: {e}")
+            return
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        confirm = await message.channel.send(f"🗑️ Deleted {len(deleted)} message(s).")
+        await confirm.delete(delay=3)
+        return
+
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_mentioned = bot.user in message.mentions
 
@@ -189,12 +235,36 @@ async def on_message(message: discord.Message):
     async with message.channel.typing():
         memory = get_memory(message.author.id)
 
-        if content.lower() == "!clear":
+        if content.lower() in ("!clear", "clear"):
             memory.clear()
             await message.reply("Memory cleared!")
             return
 
-        if content.lower() == "!reminders":
+        if content.lower() in ("!clearreminders", "clearreminders"):
+            user_jobs = [j for j in scheduler.get_jobs() if str(message.author.id) in j.id]
+            for j in user_jobs:
+                j.remove()
+            # Remove from file
+            path = "/data/reminders/reminders.json"
+            if os.path.exists(path):
+                remaining = []
+                with open(path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            r = json.loads(line)
+                            if str(r.get("user_id", "")) != str(message.author.id):
+                                remaining.append(line)
+                        except Exception:
+                            pass
+                with open(path, "w") as f:
+                    f.write("\n".join(remaining) + ("\n" if remaining else ""))
+            await message.reply(f"🗑️ Cleared {len(user_jobs)} reminder(s).")
+            return
+
+        if content.lower() in ("!reminders", "reminders"):
             jobs = scheduler.get_jobs()
             user_jobs = [j for j in jobs if str(message.author.id) in j.id]
             if not user_jobs:
@@ -207,7 +277,7 @@ async def on_message(message: discord.Message):
                 await message.reply("**Your reminders:**\n" + "\n".join(lines))
             return
 
-        if content.lower() == "!joke":
+        if content.lower() in ("!joke", "joke"):
             try:
                 async with httpx.AsyncClient(timeout=10) as client:
                     r = await client.get(
