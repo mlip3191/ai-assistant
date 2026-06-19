@@ -204,13 +204,14 @@ def get_price(query: str) -> str:
 
 def get_gif(query: str) -> str:
     import httpx
+    import random
     api_key = os.getenv("GIPHY_API_KEY")
     if not api_key:
         return "GIF search is not configured. Set GIPHY_API_KEY in .env."
     try:
         r = httpx.get(
             "https://api.giphy.com/v1/gifs/search",
-            params={"api_key": api_key, "q": query, "limit": 1, "rating": "pg-13"},
+            params={"api_key": api_key, "q": query, "limit": 25, "rating": "pg-13"},
             timeout=5
         )
         r.raise_for_status()
@@ -218,7 +219,8 @@ def get_gif(query: str) -> str:
         gifs = data.get("data", [])
         if not gifs:
             return f"No GIF found for '{query}'."
-        return gifs[0]["images"]["original"]["url"]
+        gif = random.choice(gifs)
+        return gif["images"]["original"]["url"]
     except Exception as e:
         return f"GIF search failed: {str(e)}"
 
